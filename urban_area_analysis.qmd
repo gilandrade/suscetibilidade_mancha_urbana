@@ -93,91 +93,123 @@ The Geological Survey of Brazil (SGB) provides this data via ArcGIS REST Service
 
 
 ```{r download-susceptibility}
-# Define options to bypass government firewalls:
-# 1. Increase global timeout for R
-# 2. Fake a standard Browser User-Agent so the firewall doesn't block the script
+# Define options to bypass firewalls
 options(
   timeout = 300, 
   HTTPUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Correct ArcGIS REST FeatureServer URLs (Layer 0)
-url_inundation <- "[https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/inundacao/FeatureServer/0](https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/inundacao/FeatureServer/0)"
-url_flash_flood <- "[https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/enxurrada/FeatureServer/0](https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/enxurrada/FeatureServer/0)"
-url_debris_flow <- "[https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/corrida_de_massa/FeatureServer/0](https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/corrida_de_massa/FeatureServer/0)"
+base_inundation <- "https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/inundacao"
+base_flash_flood <- "https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/enxurrada"
+base_debris_flow <- "https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/corrida_de_massa"
 
-# Helper function with native R downloading and pagination
-fetch_arcgis_data <- function(layer_url, file_name) {
+# A função suprema de download: usa fatiamento por Estado (Bounding Box)
+fetch_arcgis_spatial <- function(base_url, file_name) {
   file_path <- path(data_dir, file_name)
   
-  if (!file_exists(file_path)) {
-    cat("Downloading data from:", layer_url, "\n")
+  if (file_exists(file_path)) {
+    cat("\n✅ [SKIPPED] '", file_name, "' already exists. Loading local copy...\n", sep = "")
+    return(st_read(file_path, quiet = TRUE))
+  }
+  
+  cat("\n📥 [DOWNLOADING] '", file_name, "'. Using Spatial Chunking (State by State)...\n", sep = "")
+  
+  # Baixa os polígonos dos estados brasileiros para usar como grade de pesquisa
+  cat("   -> Loading Brazilian States grid...\n")
+  states <- read_state(year = 2020, showProgress = FALSE)
+  
+  all_features <- list()
+  endpoints <- c("FeatureServer/0", "MapServer/0")
+  
+  # Itera por cada um dos 27 estados do Brasil
+  for (i in 1:nrow(states)) {
+    state_name <- states$name_state[i]
+    cat(sprintf("   -> [%02d/27] Fetching data for: %s \n", i, state_name))
     
-    offset <- 0
-    record_count <- 10000
-    has_more <- TRUE
-    all_features <- list()
+    # Pega as coordenadas exatas do "quadrado" que envolve o estado
+    # O geobr usa SIRGAS 2000 nativamente (EPSG:4674)
+    bbox <- st_bbox(states[i, ])
+    bbox_str <- paste(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"], sep = ",")
     
-    # Loop to handle ArcGIS Server pagination
-    while (has_more) {
-      cat("Fetching records starting at offset:", offset, "\n")
+    state_success <- FALSE
+    
+    for (endpoint in endpoints) {
+      layer_url <- paste0(base_url, "/", endpoint)
       
-      query_url <- paste0(
-        layer_url, 
-        "/query?where=1%3D1&outFields=*&outSR=4674&f=geojson",
-        "&resultOffset=", offset, 
-        "&resultRecordCount=", record_count
-      )
+      # Paginação interna caso um estado tenha mais de 2.000 áreas de risco
+      offset <- 0
+      chunk_size <- 2000
+      has_more <- TRUE
       
-      # Create a temporary local file
-      temp_json <- tempfile(fileext = ".geojson")
-      
-      # Use R's native download instead of GDAL's network driver
-      tryCatch({
-        download.file(url = query_url, destfile = temp_json, mode = "wb", quiet = TRUE)
+      while (has_more) {
+        # A URL agora passa as coordenadas do estado para o banco de dados deles!
+        query_url <- paste0(
+          layer_url, 
+          "/query?where=1%3D1&outFields=*&outSR=4674&f=geojson",
+          "&geometry=", bbox_str,
+          "&geometryType=esriGeometryEnvelope",
+          "&inSR=4674",
+          "&spatialRel=esriSpatialRelIntersects",
+          "&resultOffset=", offset, 
+          "&resultRecordCount=", chunk_size
+        )
         
-        # Read the localized temporary file
-        temp_sf <- st_read(temp_json, quiet = TRUE)
+        temp_json <- tempfile(fileext = ".geojson")
         
-        if (nrow(temp_sf) > 0) {
-          all_features[[length(all_features) + 1]] <- temp_sf
-          offset <- offset + record_count
+        temp_sf <- tryCatch({
+          download.file(url = query_url, destfile = temp_json, mode = "wb", method = "libcurl", quiet = TRUE)
+          st_read(temp_json, quiet = TRUE)
+        }, error = function(e) { NULL })
+        
+        if (!is.null(temp_sf)) {
+          if (nrow(temp_sf) > 0) {
+            all_features[[length(all_features) + 1]] <- temp_sf
+            offset <- offset + chunk_size
+          } else {
+            has_more <- FALSE # Acabaram os dados deste estado
+          }
+          if (nrow(temp_sf) < chunk_size) has_more <- FALSE
+          
+          state_success <- TRUE
         } else {
-          has_more <- FALSE
+          has_more <- FALSE # Se deu erro 500, quebra e tenta o MapServer
         }
         
-        # Stop if we hit the end of the data
-        if (nrow(temp_sf) < record_count) {
-          has_more <- FALSE
-        }
-      }, error = function(e) {
-        cat("\nError on offset", offset, ":", e$message, "\n")
-        has_more <- FALSE
-      })
+        if (file_exists(temp_json)) file_delete(temp_json)
+      }
       
-      # Clean up temp file
-      if (file_exists(temp_json)) file_delete(temp_json)
+      if (state_success) break # Se deu certo no FeatureServer, não tenta o MapServer
     }
     
-    # Combine all paginated data
-    if (length(all_features) > 0) {
-      cat("\nSaving consolidated shapefile...\n")
-      vector_data <- bind_rows(all_features) |> 
-        st_make_valid()
-      st_write(vector_data, file_path, driver = "ESRI Shapefile")
-    } else {
-      stop("Falha ao baixar os dados. O servidor do SGB pode estar fora do ar.")
+    if (!state_success) {
+      cat("      ⚠️ Warning: Failed to retrieve data for", state_name, "\n")
     }
   }
   
-  # Read the local shapefile
+  if (length(all_features) > 0) {
+    cat("\n   -> Saving consolidated shapefile locally...\n")
+    
+    # Junta todos os estados, corrige geometrias
+    vector_data <- bind_rows(all_features) |> 
+      st_make_valid()
+    
+    # Como as "caixas" (bounding boxes) dos estados se sobrepõem umas às outras,
+    # áreas de risco nas divisas de estado são baixadas duas vezes. 
+    # O distinct() remove as duplicatas matemáticas perfeitamente!
+    vector_data <- distinct(vector_data)
+    
+    st_write(vector_data, file_path, driver = "ESRI Shapefile")
+  } else {
+    stop("❌ Falha crítica: não foi possível extrair os dados de nenhum estado.")
+  }
+  
   st_read(file_path, quiet = TRUE)
 }
 
-# Fetch the three datasets
-inundation <- fetch_arcgis_data(url_inundation, "inundation.shp")
-flash_flood <- fetch_arcgis_data(url_flash_flood, "flash_flood.shp")
-debris_flow <- fetch_arcgis_data(url_debris_flow, "debris_flow.shp")
+# 🚀 E agora a mágica acontece:
+inundation <- fetch_arcgis_spatial(base_inundation, "inundation.shp")
+flash_flood <- fetch_arcgis_spatial(base_flash_flood, "flash_flood.shp")
+debris_flow <- fetch_arcgis_spatial(base_debris_flow, "debris_flow.shp")
 ```
 
 ## 4. Create Susceptibility Overlay Vector
