@@ -1,1 +1,23 @@
+# Dados de entrada (MapBiomas ~6 GB, cartas do SGB) e resultados
 data/
+output/
+
+# Artefatos do editor Quarto/Positron
+.vdoc.*.r
+.quarto/
+*_files/
+urban_area_analysis.html
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Renviron
+
+# Python
+__pycache__/
+.venv/
+venv/
+
+# Instruções locais do Claude Code
+CLAUDE.md
