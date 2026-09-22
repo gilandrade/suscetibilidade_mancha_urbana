@@ -1,444 +1,499 @@
 ---
-title: "Urban Expansion over Disaster-Susceptible Areas in Brazil (1985-2025)"
-author: "Analysis Script"
-format: html
+title: "Avanço da Mancha Urbana sobre Áreas Suscetíveis a Processos Geo-Hidrológicos no Brasil"
+subtitle: "1985-2025 | figuras do resumo submetido ao SICAM"
+format:
+  html:
+    toc: true
+    df-print: paged
+    fig-align: center
 execute:
   warning: false
   message: false
 ---
 
-## 0. Setup and Libraries
+## O que este documento faz
 
-First, we load the necessary packages. We will use `tidyverse` for data manipulation, `sf` for vector spatial data, `terra` for heavy raster processing, and `geobr` to fetch Brazilian municipalities.
+Cruza o **ano da primeira urbanização** (MapBiomas Coleção 11, classe 24 — "Área
+Urbanizada") com as **cartas de suscetibilidade do SGB/CPRM** a inundação,
+enxurrada e corrida de massa, agregando por município e período quinquenal.
 
-```{r}
-'# Install pak first
-install.packages("pak")
-
-# Use pak to install your packages in a fraction of the time
-pak::pkg_install(c("tidyverse", "sf", "terra", "fs", "geobr"))'
-```
+O processamento pesado vive em [`scripts/calcula_expansao.R`](scripts/calcula_expansao.R)
+e roda uma vez, gravando `output/expansao_suscetibilidade_municipio.csv`. Este
+documento apenas consome esse arquivo e desenha as figuras, então o render leva
+segundos.
 
 ```{r setup}
-# Load required libraries
-library(tidyverse)
-library(sf)
-library(terra)
-library(geobr)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(ggpattern)
+library(scales)
 library(fs)
 
+DIR_SAIDA <- "output"
+DIR_FIGURAS <- path(DIR_SAIDA, "figuras")
+ARQUIVO <- path(DIR_SAIDA, "expansao_suscetibilidade_municipio.csv")
+ANO_BASE <- 1985
+N_TOPO <- 20
 
-# Ensure temp directory exists
-if (!dir_exists("data/temp")) dir_create("data/temp")
+dir_create(DIR_FIGURAS)
 
-# Optimize terra memory usage (use only 50% of available RAM before swapping to disk)
-terraOptions(memfrac = 0.5, tempdir = "data/temp")
-
-```
-
-## 1. Create Data Directory and Gitignore
-We create the data directory to store heavy spatial files and ensure it is ignored by Git to prevent committing large files.
-
-```{r}
-# Define data directory path
-data_dir <- "data"
-
-# Create directory if it doesn't exist
-if (!dir_exists(data_dir)) {
-  dir_create(data_dir)
-}
-
-# Add data folder to .gitignore
-gitignore_path <- ".gitignore"
-ignore_entry <- "data/"
-
-if (!file_exists(gitignore_path) || !any(str_detect(read_lines(gitignore_path), ignore_entry))) {
-  write_lines(ignore_entry, gitignore_path, append = TRUE)
+if (!file_exists(ARQUIVO)) {
+  stop("Rode antes: Rscript scripts/calcula_expansao.R BR")
 }
 ```
 
+## Reprodução
 
-
-## 2. Download MapBiomas Raster
-We check if the MapBiomas GeoTIFF (Collection 11) is already present. If not, we download it directly from Google Cloud Storage.
-
-
-```{r}
-# Define the target years for our analysis
-target_years <- c(1985, 1990, 1995, 2000, 2005, 2010, 2015, 2020, 2025)
-
-# Create a character vector of local file paths
-mapbiomas_files <- path(data_dir, str_glue("brazil_coverage-col11_{target_years}.tif"))
-
-# Iterate over the years and download if missing
-for (i in seq_along(target_years)) {
-  yr <- target_years[i]
-  file_path <- mapbiomas_files[i]
-  
-  if (!file_exists(file_path)) {
-    url <- str_glue("[https://storage.googleapis.com/mapbiomas-public/initiatives/brasil/collection11/lulc/coverage/brazil_coverage/brazil_coverage-col11](https://storage.googleapis.com/mapbiomas-public/initiatives/brasil/collection11/lulc/coverage/brazil_coverage/brazil_coverage-col11)_{yr}.tif")
-    
-    download.file(
-      url = url,
-      destfile = file_path,
-      mode = "wb"
-    )
-  }
-}
+```bash
+python scripts/converte_parquet.py     # Parquet do SGB -> GeoPackage em WGS 84
+Rscript scripts/calcula_expansao.R BR  # baixa o MapBiomas se faltar e cruza tudo
+quarto render urban_area_analysis.qmd  # desenha as figuras
 ```
 
-##  Download Susceptibility Data (ArcGIS REST API)
+O segundo passo aceita um recorte como argumento — `RJ` para uma UF, `3300100`
+para um município — o que torna possível testar em Angra dos Reis antes de rodar
+o país inteiro.
 
-The Geological Survey of Brazil (SGB) provides this data via ArcGIS REST Services. We point directly to the `FeatureServer` endpoints (layer `0` holds the polygon geometries).
+## Dados
 
+O CSV guarda a **decomposição exclusiva**: cada pixel é atribuído à combinação
+exata de cartas que o cobrem — sete combinações possíveis com três cartas. Elas
+não se sobrepõem entre si, então somam exatamente a área real. Tudo o mais é
+derivado daqui: o total de uma carta é a soma das combinações que a contêm, e a
+união é a soma de todas.
 
-```{r download-susceptibility}
-# Define options to bypass firewalls
-options(
-  timeout = 300, 
-  HTTPUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+```{r leitura}
+CARTAS <- c("Inundação", "Enxurrada", "Corrida de massa")
+
+# As 7 combinações, na ordem em que entram na pilha e na legenda: primeiro as
+# cartas isoladas, depois os pares, por fim a tripla.
+NIVEIS_COMBO <- c(
+  CARTAS,
+  "Inundação + Enxurrada",
+  "Inundação + Corrida de massa",
+  "Enxurrada + Corrida de massa",
+  "Inundação + Enxurrada + Corrida de massa"
 )
 
-base_inundation <- "https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/inundacao"
-base_flash_flood <- "https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/enxurrada"
-base_debris_flow <- "https://geoportal.sgb.gov.br/server/rest/services/gestaoterritorial/corrida_de_massa"
+expansao <- read_csv(ARQUIVO, show_col_types = FALSE) |>
+  mutate(
+    periodo = factor(periodo, levels = c(
+      "Pré-1985", str_c(seq(1986, 2021, by = 5), "-", seq(1990, 2025, by = 5))
+    )),
+    combinacao = factor(combinacao, levels = NIVEIS_COMBO)
+  )
 
-# A função suprema de download: usa fatiamento por Estado (Bounding Box)
-fetch_arcgis_spatial <- function(base_url, file_name) {
-  file_path <- path(data_dir, file_name)
-  
-  if (file_exists(file_path)) {
-    cat("\n✅ [SKIPPED] '", file_name, "' already exists. Loading local copy...\n", sep = "")
-    return(st_read(file_path, quiet = TRUE))
-  }
-  
-  cat("\n📥 [DOWNLOADING] '", file_name, "'. Using Spatial Chunking (State by State)...\n", sep = "")
-  
-  # Baixa os polígonos dos estados brasileiros para usar como grade de pesquisa
-  cat("   -> Loading Brazilian States grid...\n")
-  states <- read_state(year = 2020, showProgress = FALSE)
-  
-  all_features <- list()
-  endpoints <- c("FeatureServer/0", "MapServer/0")
-  
-  # Itera por cada um dos 27 estados do Brasil
-  for (i in 1:nrow(states)) {
-    state_name <- states$name_state[i]
-    cat(sprintf("   -> [%02d/27] Fetching data for: %s \n", i, state_name))
-    
-    # Pega as coordenadas exatas do "quadrado" que envolve o estado
-    # O geobr usa SIRGAS 2000 nativamente (EPSG:4674)
-    bbox <- st_bbox(states[i, ])
-    bbox_str <- paste(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"], sep = ",")
-    
-    state_success <- FALSE
-    
-    for (endpoint in endpoints) {
-      layer_url <- paste0(base_url, "/", endpoint)
-      
-      # Paginação interna caso um estado tenha mais de 2.000 áreas de risco
-      offset <- 0
-      chunk_size <- 2000
-      has_more <- TRUE
-      
-      while (has_more) {
-        # A URL agora passa as coordenadas do estado para o banco de dados deles!
-        query_url <- paste0(
-          layer_url, 
-          "/query?where=1%3D1&outFields=*&outSR=4674&f=geojson",
-          "&geometry=", bbox_str,
-          "&geometryType=esriGeometryEnvelope",
-          "&inSR=4674",
-          "&spatialRel=esriSpatialRelIntersects",
-          "&resultOffset=", offset, 
-          "&resultRecordCount=", chunk_size
-        )
-        
-        temp_json <- tempfile(fileext = ".geojson")
-        
-        temp_sf <- tryCatch({
-          download.file(url = query_url, destfile = temp_json, mode = "wb", method = "libcurl", quiet = TRUE)
-          st_read(temp_json, quiet = TRUE)
-        }, error = function(e) { NULL })
-        
-        if (!is.null(temp_sf)) {
-          if (nrow(temp_sf) > 0) {
-            all_features[[length(all_features) + 1]] <- temp_sf
-            offset <- offset + chunk_size
-          } else {
-            has_more <- FALSE # Acabaram os dados deste estado
-          }
-          if (nrow(temp_sf) < chunk_size) has_more <- FALSE
-          
-          state_success <- TRUE
-        } else {
-          has_more <- FALSE # Se deu erro 500, quebra e tenta o MapServer
-        }
-        
-        if (file_exists(temp_json)) file_delete(temp_json)
-      }
-      
-      if (state_success) break # Se deu certo no FeatureServer, não tenta o MapServer
-    }
-    
-    if (!state_success) {
-      cat("      ⚠️ Warning: Failed to retrieve data for", state_name, "\n")
-    }
-  }
-  
-  if (length(all_features) > 0) {
-    cat("\n   -> Saving consolidated shapefile locally...\n")
-    
-    # Junta todos os estados, corrige geometrias
-    vector_data <- bind_rows(all_features) |> 
-      st_make_valid()
-    
-    # Como as "caixas" (bounding boxes) dos estados se sobrepõem umas às outras,
-    # áreas de risco nas divisas de estado são baixadas duas vezes. 
-    # O distinct() remove as duplicatas matemáticas perfeitamente!
-    vector_data <- distinct(vector_data)
-    
-    st_write(vector_data, file_path, driver = "ESRI Shapefile")
-  } else {
-    stop("❌ Falha crítica: não foi possível extrair os dados de nenhum estado.")
-  }
-  
-  st_read(file_path, quiet = TRUE)
-}
+# 1985 é o estoque urbano que já existia no início da série: não é crescimento.
+crescimento <- filter(expansao, ano > ANO_BASE)
 
-# 🚀 E agora a mágica acontece:
-inundation <- fetch_arcgis_spatial(base_inundation, "inundation.shp")
-flash_flood <- fetch_arcgis_spatial(base_flash_flood, "flash_flood.shp")
-debris_flow <- fetch_arcgis_spatial(base_debris_flow, "debris_flow.shp")
+# Total por carta: soma as combinações que a contêm. As cartas se sobrepõem,
+# então estes totais somados excedem a união — por isso servem para a figura 1,
+# onde cada painel é lido isoladamente, e não para as figuras empilhadas.
+por_carta <- bind_rows(lapply(CARTAS, function(nc) {
+  crescimento |>
+    filter(str_detect(as.character(combinacao), fixed(nc))) |>
+    group_by(periodo) |>
+    summarise(area_km2 = sum(area_km2), .groups = "drop") |>
+    mutate(categoria = factor(nc, levels = CARTAS))
+}))
+
+glimpse(expansao)
 ```
 
-## 4. Create Susceptibility Overlay Vector
-We combine the three fetched ArcGIS layers into a single object, avoiding the heavy st_union() to preserve RAM.
+## Identidade visual
 
-```{r create-overlay}
-susceptibility_path <- path(data_dir, "susceptibility_area.shp")
+Azul para inundação, verde para enxurrada, laranja para corrida de massa — a
+mesma cor significa o mesmo processo em todas as figuras.
 
-if (!file_exists(susceptibility_path)) {
-  target_crs <- st_crs(inundation)
-  
-  # Combine the 3 polygons without unioning them
-  susceptibility_area <- bind_rows(
-    inundation |> st_transform(target_crs) |> select(geometry),
-    flash_flood |> st_transform(target_crs) |> select(geometry),
-    debris_flow |> st_transform(target_crs) |> select(geometry)
-  ) |> 
-    st_make_valid()
-  
-  st_write(susceptibility_area, susceptibility_path, driver = "ESRI Shapefile")
-} else {
-  susceptibility_area <- st_read(susceptibility_path, quiet = TRUE)
-}
+O verde é um verde-aqua, não um verde puro, e isso é deliberado: contra o laranja,
+um verde puro (`#008300`) cai para ΔE 3,2 em protanopia, a confusão vermelho-verde
+clássica. Como enxurrada e corrida de massa ficam adjacentes na pilha da figura 3,
+é justamente esse o par que precisa se separar. Com o verde-aqua o pior par fica
+em ΔE 9,2, acima do alvo de 8.
 
-# Free RAM
-rm(inundation, flash_flood, debris_flow)
-gc()
-```
+O verde-aqua, por sua vez, fica em 2,82:1 contra o fundo branco, abaixo de 3:1 —
+por isso as figuras carregam **rótulos diretos** e as tabelas acompanham cada uma.
+A identidade nunca depende só da cor.
 
-## 5. List Municipalities Overlapped by Susceptibility Area
-We use the geobr package to retrieve all Brazilian municipalities and intersect them with the unified susceptibility shapefile. The resulting list is exported to a data frame.
+**As interseções são hachuradas com as cores dos processos que se cruzam**: fundo
+da primeira carta, listras da segunda. Inundação cruzada com enxurrada é azul
+listrado de verde; com corrida de massa, azul listrado de laranja. A combinação
+dos três usa hachura cruzada, com a terceira cor no contorno das listras.
 
+```{r tema}
+CORES <- c(
+  "Inundação" = "#2a78d6", # azul
+  "Enxurrada" = "#1baf7a", # verde
+  "Corrida de massa" = "#eb6834" # laranja
+)
 
-```{r}
-# Download Brazilian municipalities (using 2022 census data as baseline)
-municipalities <- read_municipality(year = 2022, showProgress = FALSE)
+# A hachura das interseções carrega as cores dos processos que se cruzam: o
+# fundo é a primeira carta, as listras são a segunda. Assim o leitor vê QUAIS
+# tipos se sobrepõem, não apenas que há sobreposição.
+FUNDO_COMBO <- c(
+  "Inundação" = CORES[["Inundação"]],
+  "Enxurrada" = CORES[["Enxurrada"]],
+  "Corrida de massa" = CORES[["Corrida de massa"]],
+  "Inundação + Enxurrada" = CORES[["Inundação"]],
+  "Inundação + Corrida de massa" = CORES[["Inundação"]],
+  "Enxurrada + Corrida de massa" = CORES[["Enxurrada"]],
+  "Inundação + Enxurrada + Corrida de massa" = CORES[["Inundação"]]
+)
 
-# Transform to match the susceptibility CRS
-municipalities <- st_transform(municipalities, st_crs(susceptibility_area))
+# Nas cartas isoladas o padrão é "none", então esta cor nunca chega a ser
+# desenhada — repetir o fundo só evita um NA na escala.
+LISTRA_COMBO <- c(
+  "Inundação" = CORES[["Inundação"]],
+  "Enxurrada" = CORES[["Enxurrada"]],
+  "Corrida de massa" = CORES[["Corrida de massa"]],
+  "Inundação + Enxurrada" = CORES[["Enxurrada"]],
+  "Inundação + Corrida de massa" = CORES[["Corrida de massa"]],
+  "Enxurrada + Corrida de massa" = CORES[["Corrida de massa"]],
+  "Inundação + Enxurrada + Corrida de massa" = CORES[["Enxurrada"]]
+)
 
-# Keep only municipalities that intersect with the susceptibility area
-overlapped_munis <- st_filter(municipalities, susceptibility_area)
+# Só a tripla precisa de uma terceira cor: ela vai no contorno da listra.
+CONTORNO_COMBO <- LISTRA_COMBO
+CONTORNO_COMBO[["Inundação + Enxurrada + Corrida de massa"]] <- CORES[["Corrida de massa"]]
 
-# Convert to standard data.frame (dropping geometry)
-overlapped_df <- overlapped_munis |> 
-  st_drop_geometry() |> 
-  as_tibble()
+# Cruzada na tripla, para que a textura também diferencie "três" de "dois".
+PADRAO_COMBO <- c(
+  "Inundação" = "none",
+  "Enxurrada" = "none",
+  "Corrida de massa" = "none",
+  "Inundação + Enxurrada" = "stripe",
+  "Inundação + Corrida de massa" = "stripe",
+  "Enxurrada + Corrida de massa" = "stripe",
+  "Inundação + Enxurrada + Corrida de massa" = "crosshatch"
+)
 
-# Preview the data
-head(overlapped_df)
-```
+# Rótulos curtos: os nomes completos das sete combinações estouram a largura da
+# figura. Como as três cartas já aparecem por extenso nas primeiras entradas, os
+# cruzamentos podem ser abreviados sem perder o sentido.
+ROTULO_COMBO <- c(
+  "Inundação", "Enxurrada", "Corrida de massa",
+  "Inundação + enxurrada", "Inundação + corrida",
+  "Enxurrada + corrida", "Os três processos"
+)
 
-## 5. Sequential Raster Processing and Masking
-We will iterate through each year sequentially. We first crop the raster to the extent of the susceptibility areas (very fast operation) and check where it became urbanized (Class 24). If it's the first time a pixel became urban, we record that year in our master raster first_urban. Finally, we mask this combined raster perfectly to the polygons.
+# Três linhas preenchidas na horizontal: cartas isoladas, pares, tripla.
+GUIA_COMBO <- guide_legend(nrow = 3, byrow = TRUE)
 
-```{r process-raster-efficiently}
-urban_expansion_path <- path(data_dir, "urban_expansion.tif")
-
-if (!file_exists(urban_expansion_path)) {
-  
-  # Read the first raster merely to extract its CRS for projecting our vector
-  template_raster <- rast(mapbiomas_files[1])
-  
-  susceptibility_vect <- vect(susceptibility_area) |> 
-    project(crs(template_raster))
-  
-  rm(template_raster)
-  gc()
-  
-  # Initialize an empty object to store the temporal urban compilation
-  first_urban <- NULL
-  
-  # Iterate sequentially through the years
-  for (i in seq_along(target_years)) {
-    yr <- target_years[i]
-    file_path <- mapbiomas_files[i]
-    
-    # 1. Load the raster and crop it strictly to the vector's bounding box
-    mb_raster <- rast(file_path)
-    mb_cropped <- crop(mb_raster, susceptibility_vect)
-    
-    # 2. Create boolean raster representing class 24 (Urban Area)
-    is_urban <- mb_cropped == 24
-    
-    # 3. Consolidate into the master map
-    if (is.null(first_urban)) {
-      # For the first year (1985), if urban, assign year, else NA
-      first_urban <- ifel(is_urban, yr, NA)
-    } else {
-      # For subsequent years, update pixel to current year ONLY IF:
-      # - The pixel is currently urban (is_urban == TRUE)
-      # - AND the pixel was NOT previously marked as urban (is.na(first_urban))
-      first_urban <- ifel(is_urban & is.na(first_urban), yr, first_urban)
-    }
-    
-    # Clean up intermediate heavy objects per iteration
-    rm(mb_raster, mb_cropped, is_urban)
-    gc()
-  }
-  
-  # 4. Mask ONLY the final consolidated 1-band raster
-  # This sets pixels completely outside the susceptibility polygons to NA
-  final_urban_expansion <- mask(first_urban, susceptibility_vect)
-  
-  # 5. Save the output
-  writeRaster(
-    final_urban_expansion, 
-    urban_expansion_path, 
-    overwrite = TRUE, 
-    datatype = "INT2U"
+# As quatro escalas abaixo mapeiam a MESMA variável; sem name, labels e guide
+# idênticos em todas, o ggplot desenha uma legenda separada para cada estética.
+escalas_combo <- function() {
+  list(
+    scale_fill_manual(
+      values = FUNDO_COMBO, labels = ROTULO_COMBO,
+      drop = FALSE, name = NULL, guide = GUIA_COMBO
+    ),
+    scale_pattern_manual(
+      values = PADRAO_COMBO, labels = ROTULO_COMBO,
+      drop = FALSE, name = NULL, guide = GUIA_COMBO
+    ),
+    scale_pattern_fill_manual(
+      values = LISTRA_COMBO, labels = ROTULO_COMBO,
+      drop = FALSE, name = NULL, guide = GUIA_COMBO
+    ),
+    scale_pattern_colour_manual(
+      values = CONTORNO_COMBO, labels = ROTULO_COMBO,
+      drop = FALSE, name = NULL, guide = GUIA_COMBO
+    )
   )
 }
 
-# Clear vector from RAM
-rm(susceptibility_area)
-gc()
-
-# Load and plot final result
-urban_expansion <- rast(urban_expansion_path)
-plot(urban_expansion, main = "First Year of Urbanization (1985-2025)", col = rev(terrain.colors(9)))
-```
-
-## 6. Estimate Expansion Area by Category and Municipality
-
-To calculate the exact area of urban expansion over each susceptibility category per municipality, we avoid vector intersections entirely. Instead, we rasterize the municipality polygons using a unique ID, stack it with our urban expansion map, and perform a cross-tabulation. This is orders of magnitude faster than spatial polygon extractions.
-
-```{r calculate-area-muni}
-# Load the master urban expansion raster
-urban_expansion_path <- path(data_dir, "urban_expansion.tif")
-urban_expansion <- rast(urban_expansion_path)
-
-# 1. Prepare municipality vector data and create a numeric ID lookup table
-# 'overlapped_df' and 'overlapped_munis' come from Step 4
-muni_info <- overlapped_df |> 
-  mutate(muni_id = row_number())
-
-muni_vect <- overlapped_munis |> 
-  mutate(muni_id = row_number()) |> 
-  vect() |> 
-  project(crs(urban_expansion))
-
-# 2. Rasterize municipalities using the unique numeric ID
-# This creates a raster where each pixel value is the municipality ID
-muni_raster <- rasterize(
-  muni_vect, 
-  urban_expansion, 
-  field = "muni_id", 
-  background = NA
-)
-
-# Define the categories and their respective shapefile paths
-susceptibility_files <- list(
-  "Inundation" = "inundation.shp",
-  "Flash Flood" = "flash_flood.shp",
-  "Debris Flow" = "debris_flow.shp",
-  "Mass Movement" = "mass_movement.shp"
-)
-
-# Initialize an empty list to store the results
-area_results_muni <- list()
-
-# 3. Loop through each category to perform Crosstabulation
-for (cat_name in names(susceptibility_files)) {
-  
-  # Load and project the vector data for the specific category
-  shp_path <- path(data_dir, susceptibility_files[[cat_name]])
-  cat_vect <- vect(shp_path) |> 
-    project(crs(urban_expansion))
-  
-  # Rasterize the category polygons
-  cat_raster <- rasterize(
-    cat_vect, 
-    urban_expansion, 
-    field = 1, 
-    background = NA, 
-    touches = TRUE
+geom_combo <- function(...) {
+  geom_col_pattern(
+    width = 0.7, colour = "white", linewidth = 0.7,
+    position = position_stack(reverse = TRUE),
+    pattern_angle = 45, pattern_density = 0.35, pattern_spacing = 0.014,
+    pattern_key_scale_factor = 0.5, ...
   )
-  
-  # Mask the urban expansion map keeping ONLY pixels inside this category
-  urban_in_cat <- mask(urban_expansion, cat_raster)
-  
-  # Rename layers to ensure clean crosstab output column names
-  names(muni_raster) <- "muni_id"
-  names(urban_in_cat) <- "year"
-  
-  # Create a multi-band raster stack (Layer 1: Muni ID, Layer 2: Year)
-  stacked_rasters <- c(muni_raster, urban_in_cat)
-  
-  # Crosstabulate to count frequencies of unique combinations (muni_id vs year)
-  # 'long = TRUE' returns a data.frame
-  # 'useNA = FALSE' ignores pixels that are empty in either layer (crucial for RAM)
-  cross_tab <- crosstab(stacked_rasters, long = TRUE, useNA = FALSE) |> 
-    as_tibble() |> 
-    rename(pixels = Freq)
-  
-  # Calculate area metrics and join municipality names back via muni_id
-  muni_cat_summary <- cross_tab |> 
-    mutate(
-      category = cat_name,
-      area_m2 = pixels * 900,
-      area_ha = area_m2 / 10000,
-      area_km2 = area_m2 / 1e6
-    ) |> 
-    left_join(
-      muni_info |> select(muni_id, code_muni, name_muni, name_state, abbrev_state), 
-      by = "muni_id"
-    ) |> 
-    select(
-      code_muni, name_muni, abbrev_state, category, year, pixels, 
-      area_m2, area_ha, area_km2
-    )
-  
-  # Store in the list
-  area_results_muni[[cat_name]] <- muni_cat_summary
-  
-  # Free up RAM before the next loop iteration
-  rm(cat_vect, cat_raster, urban_in_cat, stacked_rasters, cross_tab)
-  gc()
 }
 
-# 4. Bind all lists into a single tidy dataframe
-final_expansion_muni <- bind_rows(area_results_muni) |> 
-  arrange(abbrev_state, name_muni, category, year)
+TINTA_PRIMARIA <- "#0b0b0b"
+TINTA_SECUNDARIA <- "#52514e"
+TINTA_SUAVE <- "#898781"
+GRADE <- "#e1e0d9"
 
-# Clear massive spatial objects from memory
-rm(muni_raster, muni_vect, urban_expansion)
-gc()
+tema_sicam <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text = element_text(colour = TINTA_SECUNDARIA),
+      plot.title = element_text(colour = TINTA_PRIMARIA, face = "bold", size = rel(1.15)),
+      plot.subtitle = element_text(colour = TINTA_SECUNDARIA, margin = margin(b = 12)),
+      plot.caption = element_text(colour = TINTA_SUAVE, hjust = 0, size = rel(0.8)),
+      plot.title.position = "plot",
+      plot.caption.position = "plot",
+      axis.text = element_text(colour = TINTA_SUAVE),
+      axis.title = element_text(colour = TINTA_SECUNDARIA),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = GRADE, linewidth = 0.3),
+      legend.position = "top",
+      legend.justification = "left",
+      legend.title = element_blank(),
+      legend.text = element_text(size = rel(0.85)),
+      legend.key.size = unit(15, "pt")
+    )
+}
 
-# Preview the final data
-head(final_expansion_muni)
+# Precisão adaptativa: valores pequenos (um município) precisam de decimal,
+# valores nacionais na casa dos milhares, não.
+formata_km2 <- function(x) {
+  precisao <- if (max(x, na.rm = TRUE) < 100) 0.1 else 1
+  label_number(big.mark = ".", decimal.mark = ",", accuracy = precisao)(x)
+}
 
+FONTE <- "Fontes: MapBiomas Coleção 11 (classe 24) e cartas de suscetibilidade do SGB/CPRM."
 ```
+
+## Figura 1 — crescimento por período e tipo de suscetibilidade
+
+Cada painel tem escala própria, o que torna legível a trajetória de cada processo.
+A inundação é tão maior que os outros dois que, numa escala comum, enxurrada e
+corrida de massa virariam faixas finas — foi o que motivou separar os painéis.
+
+```{r figura-1}
+#| fig-width: 9
+#| fig-height: 4
+
+fig1 <- ggplot(por_carta, aes(periodo, area_km2, fill = categoria)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~categoria, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = CORES, guide = "none") +
+  scale_y_continuous(labels = formata_km2, expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Crescimento urbano sobre áreas suscetíveis, por quinquênio",
+    subtitle = "Área urbanizada pela primeira vez sobre áreas suscetíveis",
+    x = NULL, y = "km²",
+    # o aviso de escala vive no caption: o subtítulo fica só com a frase do resumo
+    caption = str_c(
+      "Cada painel tem escala vertical própria — as magnitudes não são comparáveis entre painéis.\n",
+      FONTE
+    )
+  ) +
+  tema_sicam(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = rel(0.85)),
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(colour = TINTA_PRIMARIA, face = "bold", hjust = 0)
+  )
+
+ggsave(path(DIR_FIGURAS, "fig1_crescimento_por_periodo.png"), fig1,
+  width = 9, height = 4, dpi = 300, bg = "white"
+)
+ggsave(path(DIR_FIGURAS, "fig1_crescimento_por_periodo.svg"), fig1,
+  width = 9, height = 4, bg = "white"
+)
+
+fig1
+```
+
+A coluna `União` não é a soma das outras três: onde duas cartas se sobrepõem, o
+mesmo pixel entra no total das duas, mas na união conta uma vez só.
+
+```{r tabela-1}
+por_carta |>
+  pivot_wider(names_from = categoria, values_from = area_km2) |>
+  left_join(
+    crescimento |>
+      group_by(periodo) |>
+      summarise(União = sum(area_km2), .groups = "drop"),
+    by = "periodo"
+  ) |>
+  mutate(across(where(is.numeric), \(x) round(x, 1))) |>
+  rename(Período = periodo)
+```
+
+## Figura 2 — o total por quinquênio
+
+Secundária: a figura 1 mostra a trajetória de cada processo, esta mostra a
+magnitude agregada. Os segmentos são exclusivos, então a barra é a área real. As
+faixas hachuradas são o terreno suscetível a mais de um processo, que de outro
+modo seria contado duas vezes, e a hachura diz **quais** processos se cruzam ali.
+
+```{r figura-2}
+#| fig-width: 9
+#| fig-height: 5.5
+
+dados_f2 <- crescimento |>
+  group_by(periodo, combinacao) |>
+  summarise(area_km2 = sum(area_km2), .groups = "drop")
+
+totais_f2 <- dados_f2 |>
+  group_by(periodo) |>
+  summarise(total = sum(area_km2), .groups = "drop")
+
+pct <- function(x) {
+  formatC(100 * x / sum(dados_f2$area_km2),
+    format = "f", digits = 1, decimal.mark = ","
+  )
+}
+
+fig2 <- ggplot(dados_f2, aes(
+  periodo, area_km2,
+  fill = combinacao, pattern = combinacao,
+  pattern_fill = combinacao, pattern_colour = combinacao
+)) +
+  # o contorno branco cria o vão entre segmentos empilhados; reverse = TRUE
+  # empilha na mesma ordem em que a legenda é lida
+  geom_combo() +
+  geom_text(
+    data = totais_f2,
+    aes(periodo, total, label = formata_km2(total)),
+    inherit.aes = FALSE, vjust = -0.6, size = 3.2,
+    colour = TINTA_SECUNDARIA, fontface = "bold"
+  ) +
+  escalas_combo() +
+  scale_y_continuous(labels = formata_km2, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "O mesmo dado, agregado: total por quinquênio",
+    subtitle = str_wrap(str_glue(
+      "Brasil, {n_distinct(crescimento$code_muni)} municípios com crescimento ",
+      "sobre carta do SGB. Só inundação responde por ",
+      "{pct(sum(dados_f2$area_km2[dados_f2$combinacao == 'Inundação']))}% da área; ",
+      "inundação cruzada com enxurrada, ",
+      "{pct(sum(dados_f2$area_km2[dados_f2$combinacao == 'Inundação + Enxurrada']))}%."
+    ), width = 96),
+    x = NULL, y = "km²", caption = FONTE
+  ) +
+  tema_sicam()
+
+ggsave(path(DIR_FIGURAS, "fig2_total_por_periodo.png"), fig2,
+  width = 9, height = 5.5, dpi = 300, bg = "white"
+)
+# SVG pelo device cairo, não pelo svglite: o svglite descarta o preenchimento
+# listrado e devolve o segmento em cinza chapado. O custo é que o cairo converte
+# o texto em glifos, então o SVG fica menos editável.
+ggsave(path(DIR_FIGURAS, "fig2_total_por_periodo.svg"), fig2,
+  width = 9, height = 5.5, bg = "white", device = grDevices::svg
+)
+
+fig2
+```
+
+## Figura 3 — municípios com maior avanço urbano sobre áreas suscetíveis
+
+A barra é a **área real**: os segmentos são exclusivos, então somam a união e o
+rótulo bate com o comprimento. As faixas hachuradas marcam o terreno suscetível a
+mais de um processo, com as cores dos processos envolvidos — Maricá é o caso mais
+visível, com um sexto da área em terreno suscetível a inundação *e* enxurrada.
+
+Na maior parte do ranking não há hachura alguma: ali as cartas simplesmente não
+se cruzam. As duas combinações que envolvem apenas enxurrada e corrida de massa
+somam menos de 0,02% do total nacional, então aparecem na legenda mas não são
+discerníveis nas barras.
+
+```{r figura-3}
+#| fig-width: 9
+#| fig-height: 7.5
+
+topo <- crescimento |>
+  group_by(code_muni, name_muni, abbrev_state) |>
+  summarise(total_km2 = sum(area_km2), .groups = "drop") |>
+  slice_max(total_km2, n = N_TOPO) |>
+  mutate(rotulo = str_glue("{name_muni} ({abbrev_state})"))
+
+dados_f3 <- crescimento |>
+  filter(code_muni %in% topo$code_muni) |>
+  group_by(code_muni, combinacao) |>
+  summarise(area_km2 = sum(area_km2), .groups = "drop") |>
+  left_join(topo, by = "code_muni")
+
+fig3 <- ggplot(dados_f3, aes(
+  area_km2, reorder(rotulo, total_km2),
+  fill = combinacao, pattern = combinacao,
+  pattern_fill = combinacao, pattern_colour = combinacao
+)) +
+  geom_combo() +
+  geom_text(
+    data = topo,
+    aes(total_km2, reorder(rotulo, total_km2), label = formata_km2(total_km2)),
+    inherit.aes = FALSE, hjust = -0.3, size = 3.1, colour = TINTA_SECUNDARIA
+  ) +
+  escalas_combo() +
+  scale_x_continuous(labels = formata_km2, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = str_glue("Os {N_TOPO} municípios que mais urbanizaram áreas suscetíveis"),
+    subtitle = str_wrap(str_glue(
+      "Área urbanizada entre 1986 e 2025 sobre terreno suscetível, sem dupla contagem."
+    ), width = 96),
+    x = "km²", y = NULL, caption = FONTE
+  ) +
+  tema_sicam() +
+  theme(panel.grid.major.y = element_blank())
+
+ggsave(path(DIR_FIGURAS, "fig3_municipios_top.png"), fig3,
+  width = 9, height = 7.5, dpi = 300, bg = "white"
+)
+ggsave(path(DIR_FIGURAS, "fig3_municipios_top.svg"), fig3,
+  width = 9, height = 7.5, bg = "white", device = grDevices::svg
+)
+
+fig3
+```
+
+## Verificações e ressalvas
+
+Área de cada combinação exclusiva no período 1986–2025. As sete somam a união,
+por construção — é o que torna as barras empilhadas legítimas.
+
+```{r verificacoes}
+crescimento |>
+  group_by(Combinação = combinacao, `Nº de tipos` = n_tipos) |>
+  summarise(km2 = round(sum(area_km2), 2), .groups = "drop") |>
+  arrange(`Nº de tipos`, desc(km2)) |>
+  bind_rows(tibble(
+    Combinação = "TOTAL (união)", `Nº de tipos` = NA_integer_,
+    km2 = round(sum(crescimento$area_km2), 2)
+  ))
+```
+
+```{r verificacoes-base}
+tibble(
+  Métrica = c(
+    "Estoque urbano em 1985 (linha de base)",
+    "Crescimento 1986–2025 (união)",
+    "Crescimento com mais de um tipo"
+  ),
+  km2 = round(c(
+    sum(expansao$area_km2[expansao$ano == ANO_BASE]),
+    sum(crescimento$area_km2),
+    sum(crescimento$area_km2[crescimento$n_tipos > 1])
+  ), 1)
+)
+```
+
+**Sobreposição entre cartas.** Como cada pixel é atribuído à combinação exata de
+cartas que o cobrem, não há dupla contagem em lugar nenhum e a união é a soma
+direta das combinações. A fatia com mais de um tipo é pequena no agregado
+nacional, e é justamente esse número que a faixa listrada das figuras 2 e 3
+mostra — antes ele ficava invisível dentro de barras infladas.
+
+**Área por célula.** O raster do MapBiomas é geográfico (graus). A célula só mede
+30 × 30 m no equador e encolhe para ~825 m² na latitude de Angra dos Reis. O
+cálculo usa `terra::cellSize(unit = "m")`, célula a célula; adotar 900 m² fixo
+superestimaria a área em 8–17% no Centro-Sul, onde está a maior parte dos dados.
+
+**Cobertura desigual.** As três cartas cobrem conjuntos diferentes de municípios
+(742 para inundação, 359 para enxurrada, 242 para corrida de massa). Comparar
+áreas entre tipos mede, em parte, quem foi mapeado. Para um recorte comparável,
+a coluna `tem_3_cartas` do CSV marca os 209 municípios que têm as três.
+
+**Reversões.** O "primeiro ano urbano" ignora, por construção, pixels que saem da
+classe 24 depois de entrar. O processamento também assume que a mancha urbana é
+essencialmente monotônica: cada ladrilho de ~28 × 28 km é descartado quando não
+tem nenhum pixel urbano em 2025, o que dispensa ler os outros oito anos. Um
+ladrilho que tivesse área urbana no passado e nenhuma em 2025 seria perdido —
+situação sem correspondência real nessa escala, mas é uma suposição, não um
+resultado.
+
+**Divergência com `data/mancha_urbana_1985_2024.tif`.** Aquele raster, de
+procedência não documentada e série terminando em 2024, marca ~20% mais área
+urbana em 1985 que a Coleção 11. Onde ele diz urbano, a Coleção 11 classifica
+9,05 dos 12,47 km² como classe 24 em Angra; o restante cai em mosaico de usos,
+praia e água. Este pipeline usa a Coleção 11, que é a definição documentada e
+reproduzível.
